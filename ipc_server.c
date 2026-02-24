@@ -25,7 +25,7 @@
 #define DAEMON_NAME         "c_daemon"
 #define PIDFILE_NAME        "/tmp/c_daemon.pid"
 #define FIFO_NAME           "/tmp/c_fifo"
-#define SHM_STATS_FILE       "server_stats.file"
+#define SHM_STATS_FILE       "/server_stats"
 #define PIDFILE_MODE        (S_IRWXU | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH)
 #define FIFO_MODE           (S_IRWXU | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH)
 #define SEM_MODE            (S_IRWXU | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH)
@@ -98,6 +98,11 @@ int main(int argc, char *argv[], char *envp[])
     pthread_attr_t attr;
     pthread_t tid;
 
+    if(atexit(cleanup) < 0) {
+        perror("atexit");
+        exit(1);
+    }
+        
     snprintf(daemon_name, sizeof(daemon_name), "%s.%d", DAEMON_NAME, getpid());
     to_daemon(daemon_name);
 
@@ -113,7 +118,6 @@ int main(int argc, char *argv[], char *envp[])
     shm_fd = shm_open(SHM_STATS_FILE, O_CREAT | O_RDWR, 0644);
     if (shm_fd == -1) {
         syslog(LOG_ERR, "shm_open %s: %s", SHM_STATS_FILE, strerror(errno));
-        cleanup();
         exit(1);
     }
     
@@ -121,7 +125,6 @@ int main(int argc, char *argv[], char *envp[])
     if (ftruncate(shm_fd, SHM_SIZE) < 0) {
         syslog(LOG_ERR, "ftruncate: %s", strerror(errno));
         close(shm_fd);
-        cleanup();
         exit(1);
     }
 
@@ -129,7 +132,6 @@ int main(int argc, char *argv[], char *envp[])
     stats = mmap(NULL, SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
     if (stats == MAP_FAILED) {
         syslog(LOG_ERR, "невозможно отобразить память: %s", strerror(errno));
-        cleanup();
         exit(1);
     }
     memset((struct ServerStats *) stats, 0, SHM_SIZE);
@@ -140,7 +142,6 @@ int main(int argc, char *argv[], char *envp[])
     semServerStats = sem_open(sem_name, O_CREAT | O_RDWR, SEM_MODE, 1);
     if (semServerStats == SEM_FAILED) {
         syslog(LOG_ERR, "невозможно создать семафор: %s", strerror(errno));
-        cleanup();
         exit(1);
     }
 
@@ -157,20 +158,17 @@ int main(int argc, char *argv[], char *envp[])
     if (sigaction(SIGHUP, &sa, NULL) < 0) {
         syslog(LOG_ERR, "sigaction: невозможно перехватить сигнал SIGHUP:\
 %s", strerror(errno));
-            cleanup();
             exit(1);
     }
     if (sigaction(SIGCHLD, &sa, NULL) < 0) {
         syslog(LOG_ERR, "sigaction: невозможно перехватить сигнал SIGCHLD:\
 %s", strerror(errno));
-            cleanup();
             exit(1);
     }
 
     sigfillset(&mask);
     if (pthread_sigmask(SIG_BLOCK, &mask, NULL) < 0 ) {
         syslog(LOG_ERR, "pthread_sigmask: %s", strerror(errno));
-        cleanup();
         exit(1);
     }
     
@@ -181,7 +179,6 @@ int main(int argc, char *argv[], char *envp[])
     if (pthread_create(&tid, &attr, sig_thr, NULL) < 0) {
         syslog(LOG_ERR, "pthread_create: %s", strerror(errno));
         pthread_attr_destroy(&attr);
-        cleanup();
         exit(1);
     }
     pthread_attr_destroy(&attr);
@@ -189,13 +186,16 @@ int main(int argc, char *argv[], char *envp[])
     if (mkfifo(FIFO_NAME, FIFO_MODE) < 0) {
         if (errno != EEXIST) {
             syslog(LOG_ERR, "mkfifo: %s", strerror(errno));
-            cleanup();
             exit(1);
         }
     }
 
     fd = open(FIFO_NAME, O_RDWR);
     if (fd == -1) {
+        if(errno == 2) {
+            syslog(LOG_ERR, "конвейер '%i' не создан: %s\n", FIFO_MODE, 
+                    strerror(errno));
+        } else
         syslog(LOG_ERR, "open %s: %s", FIFO_NAME, strerror(errno));
         closelog();
         exit(1);
@@ -211,25 +211,21 @@ int main(int argc, char *argv[], char *envp[])
         int ret = poll(&pfd, 1, POLL_TIMEOUT);
         if (ret == -1) {
             syslog(LOG_ERR, "poll: %s", strerror(errno));
-            cleanup();
             exit(1);
         }
 
         if (pfd.revents & POLL_ERR) {
             syslog(LOG_ERR, "соединение сломалось: %s", strerror(errno));
-            cleanup();
             exit(1);
         }
 
         if (pfd.revents & POLL_HUP) {
             syslog(LOG_ERR, "соединение разорвано: %s", strerror(errno));
-            cleanup();
             exit(1);
         }
 
         if (pfd.revents & POLLNVAL) {
             syslog(LOG_ERR, "дескриптор %d неверный (закрыт или никогда не открывался)",fd);
-            cleanup();
             exit(1);
         }
 
@@ -238,7 +234,6 @@ int main(int argc, char *argv[], char *envp[])
             req = (struct RequestClient *)malloc(sizeof(*req));
             if (!req) {
                 syslog(LOG_ERR, "malloc: %s", strerror(errno));
-                cleanup();
                 exit(1);
             }
             if ((nbyte = read(fd, req, sizeof(*req))) < 0) {
@@ -258,7 +253,6 @@ int main(int argc, char *argv[], char *envp[])
                 if (pthread_create(&tid, NULL, handle_client, (void *)req) < 0) {
                     syslog(LOG_ERR, "pthread_create (handle_client): %s", strerror(errno));
                     pthread_attr_destroy(&attr);
-                    cleanup();
                     exit(1);
                 }
                 pthread_attr_destroy(&attr);
@@ -274,7 +268,6 @@ int main(int argc, char *argv[], char *envp[])
     }
     pthread_mutex_unlock(&mtxActiveThr);
     
-    cleanup();
     exit(0);
 }
 
@@ -291,21 +284,25 @@ void default_stats(void)
 }
 
 void *handle_client(void *arg) {
-    if (!server_running)
+    struct RequestClient *req = (struct RequestClient *)arg;
+
+    if (!server_running){
+        free(req);
         return ((void *)0);
+    }
 
     pthread_mutex_lock(&mtxActiveThr);
     active_pthreads ++;
     pthread_mutex_unlock(&mtxActiveThr);
 
-    struct RequestClient *req = (struct RequestClient *)arg;
     if (req->pid <= 0) {
         syslog(LOG_ERR, "Получен запрос от клиента который неверно передал свой PID: %d",
             req->pid);
+        free(req);
         return ((void *) 0);
     }
 
-    int white_list[4] = {ROOT, USER1, USER2};
+    int white_list[3] = {ROOT, USER1, USER2};
     int uid_is_white = 0;
     uid_t uid_client = get_uid_by_pid(req->pid);
 
@@ -324,8 +321,11 @@ void *handle_client(void *arg) {
 
     if (sem_wait(semServerStats) < 0) {
         syslog(LOG_ERR, "sem_wait: %s", strerror(errno));
-        cleanup();
-        exit(1);
+        free(req);
+        pthread_mutex_lock(&mtxActiveThr);
+        active_pthreads--;
+        pthread_mutex_unlock(&mtxActiveThr);
+        return((void *)0);
     }
 
     stats->uid_counts[uid_client]++;
@@ -337,13 +337,16 @@ void *handle_client(void *arg) {
     stats->total_requests ++;
     if (sem_post(semServerStats) < 0) {
         syslog(LOG_ERR, "sem_post: %s",strerror(errno));
-        cleanup();
-        exit(1);
+        free(req);
+        pthread_mutex_lock(&mtxActiveThr);
+        active_pthreads--;
+        pthread_mutex_unlock(&mtxActiveThr);
+        return((void *)0);
     }
 
     pthread_mutex_lock(&mtxActiveThr);
     active_pthreads--;
-    if (active_pthreads == 0 && server_running == 0) {
+    if ((active_pthreads == 0) && (server_running == 0)) {
         pthread_cond_signal(&condActiveThr);
     }
     pthread_mutex_unlock(&mtxActiveThr);
@@ -358,7 +361,6 @@ void *sig_thr(void *arg)
         int ret = sigwait(&mask, &signo);        
         if (ret != 0) {
             syslog(LOG_ERR, "невозможно дождаться сигнала: sigwait: %s", strerror(errno));
-            cleanup();
             exit(1);
         }
 
@@ -387,23 +389,32 @@ uid_t get_uid_by_pid(pid_t pid)
 
 void cleanup(void)
 {
-    if (unlink(PIDFILE_NAME) < 0)
-        syslog(LOG_ERR, "невозможно удалить файл: %s: %s", 
-            PIDFILE_NAME, strerror(errno));
-    else
+    if (unlink(PIDFILE_NAME) < 0) {
+        if(errno!=ENOENT)
+            syslog(LOG_ERR, "невозможно удалить файл: %s: %s", 
+                PIDFILE_NAME, strerror(errno));
+    } else
         syslog(LOG_INFO, "файл %s удален", PIDFILE_NAME);
     
-    if (shm_unlink(SHM_STATS_FILE) < 0) 
-        syslog(LOG_ERR, "невозможно удалить файл: %s: %s", 
-            SHM_STATS_FILE, strerror(errno));
-    else
+    if (shm_unlink(SHM_STATS_FILE) < 0) { 
+        if(errno!=ENOENT) 
+            syslog(LOG_ERR, "невозможно удалить файл: %s: %s", 
+                SHM_STATS_FILE, strerror(errno));
+            
+    } else
         syslog(LOG_INFO, "файл %s удален", SHM_STATS_FILE);
 
-    if (sem_unlink(sem_name) < 0) 
-        syslog(LOG_ERR, "невозможно удалить файл: %s: %s", 
-            sem_name, strerror(errno));
-    else 
+    if (sem_unlink(sem_name) < 0) { 
+        if(errno!=ENOENT)
+            syslog(LOG_ERR, "невозможно удалить файл: %s: %s", 
+                sem_name, strerror(errno));
+    } else 
         syslog(LOG_INFO, "файл-семафор %s удален", sem_name);
+
+    if(semServerStats != SEM_FAILED)
+        sem_close(semServerStats);
+    if((stats != ((void *)0)) && (stats != MAP_FAILED))
+        munmap(stats, SHM_SIZE);
 
     syslog(LOG_INFO, "СЕРВЕР ЗАВЕРШИЛСЯ");
 
@@ -421,10 +432,7 @@ int lockfile(int fd)
     lock.l_whence = SEEK_SET;
     lock.l_type = F_WRLCK;
 
-    if (fcntl(fd, F_SETLK, &lock) < 0) {
-        return(-1);
-    }
-    return(0);
+    return(fcntl(fd, F_SETLK, &lock));
 }
 
 int already_running(void)
