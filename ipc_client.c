@@ -1,5 +1,3 @@
-#define _GNU_SOURCE
-
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -28,9 +26,13 @@ int main(void)
     }
 
     req.pid = getpid();
-    strcpy(req.message, message);
 
-    int nbyte;
+    strncpy(req.message, message, BUFSIZ-1);
+    req.message[BUFSIZ-1] = 0;
+    if(strlen(message) >= BUFSIZ-1)
+        fprintf(stderr, "строка '%s была обрезана\n", message);
+
+    ssize_t nbyte;
     if ((nbyte = write(fd, &req, sizeof(req))) != sizeof(req)) {
         perror("write");
         exit(1);
